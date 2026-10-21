@@ -200,3 +200,56 @@ async def delete(job:str):
  if len(job)!=32 or not all(c in '0123456789abcdef' for c in job): raise HTTPException(404)
  shutil.rmtree(WORK/job,ignore_errors=True)
  return {'ok':True}
+
+
+@app.post('/api/images-to-epub')
+async def images_to_epub(files: list[UploadFile] = File(...), title: str = Form('我的画册'), direction: str = Form('ltr')):
+ if not 1 <= len(files) <= 150: raise HTTPException(400,'请选择 1 到 150 张图片')
+ if direction not in ('ltr','rtl'): raise HTTPException(400,'阅读方向无效')
+ clean()
+ job=uuid.uuid4().hex; folder=WORK/job; folder.mkdir(mode=0o700)
+ try:
+  pictures=[]; total=0
+  for idx, f in enumerate(files):
+   suffix=Path(f.filename or '').suffix.lower()
+   if suffix not in ('.png','.jpg','.jpeg','.webp','.bmp','.gif','.tif','.tiff','.heic','.avif'):
+    raise ValueError('包含不支持的图片格式：'+suffix)
+   content=await f.read(MAX_BYTES+1)
+   total+=len(content)
+   if total>MAX_BYTES: raise ValueError('所有图片合计不能超过上传限制')
+   def normalize(data):
+    with Image.open(io.BytesIO(data)) as im:
+     im=ImageOps.exif_transpose(im)
+     if im.width*im.height>50000000: raise ValueError('单张图片像素过大')
+     if getattr(im,'n_frames',1)>1: im.seek(0)
+     out=io.BytesIO()
+     if im.mode not in ('RGB','RGBA'): im=im.convert('RGBA')
+     im.save(out,format='PNG',optimize=True)
+     return out.getvalue(),im.size
+   blob,size=await asyncio.to_thread(normalize,content)
+   pictures.append((blob,size))
+  import html
+  book_title=html.escape(title.strip()[:100] or '我的画册')
+  dest=folder/'output.epub'
+  identifier='urn:uuid:'+str(uuid.uuid4())
+  with zipfile.ZipFile(dest,'w') as z:
+   z.writestr('mimetype','application/epub+zip',compress_type=zipfile.ZIP_STORED)
+   z.writestr('META-INF/container.xml','<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>')
+   manifest=[]; spine=[]; nav=[]
+   for i,(blob,(w,h)) in enumerate(pictures,1):
+    name=f'page{i:04d}'
+    z.writestr(f'OEBPS/images/{name}.png',blob)
+    page=f'''<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{book_title} - {i}</title><meta name="viewport" content="width={w},height={h}"/><style>html,body{{margin:0;padding:0}}img{{display:block;width:100%;height:auto}}</style></head><body><div><img src="images/{name}.png" alt="Page {i}"/></div></body></html>'''
+    z.writestr(f'OEBPS/{name}.xhtml',page)
+    manifest.extend([f'<item id="{name}" href="{name}.xhtml" media-type="application/xhtml+xml"/>',f'<item id="img{i}" href="images/{name}.png" media-type="image/png"/>'])
+    spine.append(f'<itemref idref="{name}"/>')
+    nav.append(f'<li><a href="{name}.xhtml">第 {i} 页</a></li>')
+   nav_doc='<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>目录</title></head><body><nav epub:type="toc" id="toc"><ol>'+''.join(nav)+'</ol></nav></body></html>'
+   z.writestr('OEBPS/nav.xhtml',nav_doc)
+   manifest.append('<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>')
+   opf=f'''<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid" xml:lang="zh"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">{identifier}</dc:identifier><dc:title>{book_title}</dc:title><dc:language>zh</dc:language><meta property="dcterms:modified">{__import__('datetime').datetime.now(__import__('datetime').timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}</meta></metadata><manifest>{''.join(manifest)}</manifest><spine page-progression-direction="{direction}">{''.join(spine)}</spine></package>'''
+   z.writestr('OEBPS/content.opf',opf)
+  return {'id':job,'name':'album.epub','bytes':dest.stat().st_size,'download':'/api/download/'+job}
+ except Exception as e:
+  shutil.rmtree(folder,ignore_errors=True)
+  raise HTTPException(422,str(e))
